@@ -1,0 +1,17 @@
+torch
+mlflow==3.11.1
+datasets>=2.20.0
+transformers[torch]
+accelerate
+peft>=0.12.0
+huggingface_hub>=0.24.0
+tqdm
+boto3
+python-dotenv
+langchain
+langchain-core
+langchain-mcp-adapters
+langchain-huggingface
+langchain-text-splitters
+pypdf
+ipywidgets

@@ -1,0 +1,70 @@
+# llm/api — large / bulk data (use with ../.gitignore at repo root)
+# https://git-scm.com/docs/gitignore
+
+# --- Model weights (GitHub limit 100 MB / file) ---
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# --- Common dump directories ---
+data/
+raw/
+processed/
+datasets_local/
+bulk_downloads/
+scratch/
+
+# --- Columnar & analytics binary formats ---
+*.parquet
+*.pq
+*.orc
+*.avro
+*.feather
+*.arrow
+*.ipc
+*.bcolz
+
+# --- Serialized tables / ML tables ---
+*.h5
+*.hdf5
+# *.xlsx
+# *.xls
+
+# --- Archives (datasets are often shipped this way) ---
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.7z
+*.rar
+
+# --- Python / ML serialization blobs ---
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.msgpack
+
+# --- SQLite & local DB files ---
+*.sqlite
+*.sqlite3
+*.db
+
+# --- Streamed text corpora (often huge) ---
+*.jsonl
+*.jsonl.gz
+*.ndjson
+
+# --- Hugging Face / cache if created under api/ ---
+.cache/
+.huggingface/
+
+.env
+
+# --- Optional: uncomment if you never want CSV/TSV in git under api/ ---
+# *.csv
+# *.tsv

@@ -1,0 +1,47 @@
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Model weights & checkpoints ---
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+
+# --- Training / adapter outputs ---
+**/qwen-qa-lora-cpu/
+**/checkpoint*/
+**/checkpoints/
+**/hf_cache/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- ML & logs ---
+mlruns/
+wandb/
+*.log
+
+# --- HF cache if under repo ---
+.cache/
+.huggingface/
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
