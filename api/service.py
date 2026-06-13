@@ -21,9 +21,35 @@ from peft import PeftModel
 from pypdf import PdfReader
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
+try:
+    from langfuse import observe
+except ImportError:  # pragma: no cover - optional until langfuse is installed
+    def observe(*_args, **_kwargs):
+        def decorator(func):
+            return func
+
+        return decorator
+
 API_DIR = Path(__file__).resolve().parent
 # Do not override variables already set by Docker Compose / the shell.
+load_dotenv(API_DIR.parent / ".env", override=False)
 load_dotenv(API_DIR / ".env", override=False)
+
+
+def langfuse_enabled() -> bool:
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
+
+
+def flush_langfuse() -> None:
+    if not langfuse_enabled():
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().flush()
+    except Exception:
+        pass
+
 
 BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 ADAPTER_REPO = os.getenv("ADAPTER_REPO", "Glccampos/llm_qween")
@@ -238,6 +264,21 @@ def load_model() -> None:
     qa_chain = RunnableLambda(format_qa_prompt) | llm | StrOutputParser()
 
 
+@observe(name="llm_qween_pdf_qa", as_type="generation")
+def _llm_qween_pdf_qa(context: str, question: str) -> str:
+    return qa_chain.invoke({"context": context, "question": question}).strip()
+
+
+@observe(name="llm_qween_trino_sql", as_type="generation")
+def _llm_qween_trino_sql(prompt: str) -> str:
+    return llm.invoke(prompt).strip()
+
+
+@observe(name="llm_qween_trino_summary", as_type="generation")
+def _llm_qween_trino_summary(prompt: str) -> str:
+    return llm.invoke(prompt).strip()
+
+
 def load_pdf_index(pdf_path: str | None = None) -> int:
     global chunks, chunk_term_counts, document_frequencies
 
@@ -287,11 +328,51 @@ def retrieve_context(question: str, top_k: int = 3) -> str:
     return "\n\n---\n\n".join(best_chunks or chunks[:top_k])
 
 
+@observe(name="answer_from_pdf", as_type="span")
 def answer_from_pdf(question: str) -> str:
     context = retrieve_context(question)
-    return qa_chain.invoke({"context": context, "question": question}).strip()
+    return _llm_qween_pdf_qa(context, question)
 
 
+def _mcp_trace_output(result: dict) -> dict:
+    """Compact MCP tool response for Langfuse (avoid huge row payloads)."""
+    if not isinstance(result, dict):
+        return {"value": result}
+    traced = dict(result)
+    rows = traced.get("rows")
+    if isinstance(rows, list) and len(rows) > 10:
+        traced["rows"] = rows[:10]
+        traced["_rows_truncated"] = len(rows) - 10
+        traced["_row_count"] = len(rows)
+    return traced
+
+
+def _annotate_mcp_tool_span(name: str, arguments: dict) -> None:
+    if not langfuse_enabled():
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().update_current_span(
+            name=f"mcp_trino_{name}",
+            input={"tool": name, "arguments": arguments},
+        )
+    except Exception:
+        pass
+
+
+def _record_mcp_tool_output(result: dict) -> None:
+    if not langfuse_enabled():
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().update_current_span(output=_mcp_trace_output(result))
+    except Exception:
+        pass
+
+
+@observe(name="mcp_trino_init", as_type="span")
 async def init_trino_mcp() -> list[str]:
     global mcp_client, trino_tools, trino_tool_names, trino_mcp_ready, trino_mcp_error
 
@@ -327,12 +408,14 @@ def _normalize_mcp_result(value):
     return {"value": value}
 
 
+@observe(as_type="tool", capture_output=False)
 async def call_trino_tool(name: str, arguments: dict | None = None):
     if not trino_mcp_ready:
         raise RuntimeError(
             trino_mcp_error or "Trino MCP is not connected. Check /health and TRINO_MCP_SSE_URL."
         )
     arguments = arguments or {}
+    _annotate_mcp_tool_span(name, arguments)
     matches = [
         tool
         for tool in trino_tools
@@ -341,7 +424,9 @@ async def call_trino_tool(name: str, arguments: dict | None = None):
     if not matches:
         raise ValueError(f"Tool {name!r} not found. Available: {trino_tool_names}")
     raw_result = await matches[0].ainvoke(arguments)
-    return _normalize_mcp_result(raw_result)
+    result = _normalize_mcp_result(raw_result)
+    _record_mcp_tool_output(result)
+    return result
 
 
 def _rows_to_markdown(columns, rows, max_rows=20):
@@ -406,6 +491,7 @@ def _normalize_json_sql(sql: str) -> str:
     return fixed.strip()
 
 
+@observe(name="get_trino_schema_context", as_type="span")
 async def get_trino_schema_context(catalog="iceberg", schema="forecast", max_tables=20):
     table_result = await call_trino_tool(
         "list_tables", {"schema_name": f"{catalog}.{schema}"}
@@ -438,6 +524,7 @@ def _summarize_result(question: str, result: dict) -> str:
     return f"Result preview:\n{preview}"
 
 
+@observe(name="generate_trino_sql", as_type="span")
 async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"):
     schema_context = await get_trino_schema_context(catalog=catalog, schema=schema)
     messages = [
@@ -465,9 +552,11 @@ async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"
         },
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return _normalize_json_sql(_extract_sql(llm.invoke(prompt)))
+    raw_sql = _llm_qween_trino_sql(prompt)
+    return _normalize_json_sql(_extract_sql(raw_sql))
 
 
+@observe(name="ask_trino", as_type="span")
 async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_rows=100):
     sql = await generate_trino_sql(question, catalog=catalog, schema=schema)
     result = await call_trino_tool("query", {"sql": sql, "max_rows": max_rows})
@@ -486,7 +575,7 @@ async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_row
         },
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    answer = llm.invoke(prompt).strip()
+    answer = _llm_qween_trino_summary(prompt)
     if not answer:
         answer = _summarize_result(question, result)
     return {"question": question, "sql": sql, "result": result, "answer": answer}

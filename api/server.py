@@ -42,7 +42,10 @@ async def lifespan(_: FastAPI):
         print(f"Trino MCP tools: {tool_names}")
     elif service.trino_mcp_error:
         print(f"Trino MCP skipped: {service.trino_mcp_error}")
+    if service.langfuse_enabled():
+        print("Langfuse tracing enabled")
     yield
+    service.flush_langfuse()
 
 
 app = FastAPI(
@@ -64,6 +67,7 @@ def health():
         "trino_mcp_ready": service.trino_mcp_ready,
         "trino_tools": service.trino_tool_names,
         "trino_mcp_error": service.trino_mcp_error,
+        "langfuse_enabled": service.langfuse_enabled(),
     }
 
 
