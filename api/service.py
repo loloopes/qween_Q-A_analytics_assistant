@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+import asyncio
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -61,9 +62,70 @@ def _mark_cache_hit() -> None:
     try:
         from langfuse import get_client
 
-        get_client().update_current_span(metadata={"cache_hit": True})
+        client = get_client()
+        client.update_current_span(metadata={"cache_hit": True})
+        client.score_current_span(name="cache_hit", value=1, data_type="BOOLEAN")
     except Exception:
         pass
+
+
+def _count_tokens(text: str) -> int:
+    if not text or tokenizer is None:
+        return 0
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def trino_semantic_cache_enabled() -> bool:
+    """Trino answers must hit MCP for live query results; off by default."""
+    return os.getenv("SEMANTIC_CACHE_TRINO_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _run_llm_generation(name: str, prompt: str, invoke) -> str:
+    """Run LLM inference and record model, tokens, and cost on the generation observation."""
+    if not langfuse_enabled():
+        return invoke().strip()
+
+    from langfuse import get_client
+
+    client = get_client()
+    with client.start_as_current_observation(
+        as_type="generation",
+        name=name,
+        model=LANGFUSE_MODEL_NAME,
+        input=prompt,
+    ) as generation:
+        output = invoke().strip()
+        input_tokens = _count_tokens(prompt)
+        output_tokens = _count_tokens(output)
+        input_cost = input_tokens * LANGFUSE_INPUT_PRICE_PER_UNIT
+        output_cost = output_tokens * LANGFUSE_OUTPUT_PRICE_PER_UNIT
+        generation.update(
+            output=output,
+            model=LANGFUSE_MODEL_NAME,
+            usage_details={
+                "input": input_tokens,
+                "output": output_tokens,
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total": input_tokens + output_tokens,
+            },
+            cost_details={
+                "input": input_cost,
+                "output": output_cost,
+                "total": input_cost + output_cost,
+            },
+        )
+        return output
+
+
+async def _await_llm_generation(name: str, prompt: str, invoke) -> str:
+    """Run sync LLM inference off the event loop so MCP SSE stays alive."""
+    return await asyncio.to_thread(_run_llm_generation, name, prompt, invoke)
 
 
 @dataclass
@@ -113,6 +175,10 @@ def langfuse_api_trace(ctx: ApiTraceContext, *, operation: str) -> Iterator[str 
 BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 ADAPTER_REPO = os.getenv("ADAPTER_REPO") or os.getenv("HF_REPO_ID") or "Glccampos/llm_qween"
 HF_TOKEN = os.getenv("HF_TOKEN")
+# Must match a Langfuse model definition regex (e.g. (?i)^(qween)$ → send "qween").
+LANGFUSE_MODEL_NAME = os.getenv("LANGFUSE_MODEL_NAME", "qween")
+LANGFUSE_INPUT_PRICE_PER_UNIT = float(os.getenv("LANGFUSE_INPUT_PRICE_PER_UNIT", "0.01"))
+LANGFUSE_OUTPUT_PRICE_PER_UNIT = float(os.getenv("LANGFUSE_OUTPUT_PRICE_PER_UNIT", "0.01"))
 PDF_PATH = os.getenv("PDF_PATH", str(API_DIR / "Analytics Engineer .pdf"))
 
 USE_SAMPLING = True
@@ -143,6 +209,26 @@ trino_mcp_error: str | None = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+
+# Heuristic keywords for routing /ask → Trino (credit-risk / prediction_events domain).
+_TRINO_ROUTE_PATTERN = re.compile(
+    r"(?i)\b("
+    r"cliente?s?|clientes|customers?|"
+    r"empr[eé]stimo|empr[eé]stimos|loan|loans|credito|cr[eé]dito|"
+    r"negad[oa]s?|denied|aprovad[oa]s?|approved|"
+    r"contrato|contratos|contract|"
+    r"predi[cç][aã]o|predi[cç][oõ]es|prediction|probabilidade|probability|"
+    r"threshold|forecast|iceberg|trino|"
+    r"quantos?|quanto|how\s+many|count|total|"
+    r"prediction_events|client_id|threshold_decision|"
+    r"solicita[cç][aã]o|aplica[cç][aã]o"
+    r")\b"
+)
+
+
+def should_route_to_trino(question: str) -> bool:
+    """True when a natural-language question should use Trino instead of PDF RAG."""
+    return bool(_TRINO_ROUTE_PATTERN.search(question.strip()))
 
 
 def _find_trino_mcp_dir() -> Path:
@@ -323,19 +409,25 @@ def load_model() -> None:
     qa_chain = RunnableLambda(format_qa_prompt) | llm | StrOutputParser()
 
 
-@observe(name="llm_qween_pdf_qa", as_type="generation")
 def _llm_qween_pdf_qa(context: str, question: str) -> str:
-    return qa_chain.invoke({"context": context, "question": question}).strip()
+    prompt = (
+        "Answer the question using only the context when context is provided.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question:\n{question}"
+    )
+    return _run_llm_generation(
+        "llm_qween_pdf_qa",
+        prompt,
+        lambda: qa_chain.invoke({"context": context, "question": question}),
+    )
 
 
-@observe(name="llm_qween_trino_sql", as_type="generation")
 def _llm_qween_trino_sql(prompt: str) -> str:
-    return llm.invoke(prompt).strip()
+    return _run_llm_generation("llm_qween_trino_sql", prompt, lambda: llm.invoke(prompt))
 
 
-@observe(name="llm_qween_trino_summary", as_type="generation")
 def _llm_qween_trino_summary(prompt: str) -> str:
-    return llm.invoke(prompt).strip()
+    return _run_llm_generation("llm_qween_trino_summary", prompt, lambda: llm.invoke(prompt))
 
 
 def load_pdf_index(pdf_path: str | None = None) -> int:
@@ -413,31 +505,6 @@ def _mcp_trace_output(result: dict) -> dict:
     return traced
 
 
-def _annotate_mcp_tool_span(name: str, arguments: dict) -> None:
-    if not langfuse_enabled():
-        return
-    try:
-        from langfuse import get_client
-
-        get_client().update_current_span(
-            name=f"mcp_trino_{name}",
-            input={"tool": name, "arguments": arguments},
-        )
-    except Exception:
-        pass
-
-
-def _record_mcp_tool_output(result: dict) -> None:
-    if not langfuse_enabled():
-        return
-    try:
-        from langfuse import get_client
-
-        get_client().update_current_span(output=_mcp_trace_output(result))
-    except Exception:
-        pass
-
-
 @observe(name="mcp_trino_init", as_type="span")
 async def init_trino_mcp() -> list[str]:
     global mcp_client, trino_tools, trino_tool_names, trino_mcp_ready, trino_mcp_error
@@ -474,25 +541,38 @@ def _normalize_mcp_result(value):
     return {"value": value}
 
 
-@observe(as_type="tool", capture_output=False)
 async def call_trino_tool(name: str, arguments: dict | None = None):
     if not trino_mcp_ready:
         raise RuntimeError(
             trino_mcp_error or "Trino MCP is not connected. Check /health and TRINO_MCP_SSE_URL."
         )
     arguments = arguments or {}
-    _annotate_mcp_tool_span(name, arguments)
-    matches = [
-        tool
-        for tool in trino_tools
-        if tool.name == name or tool.name.endswith(name)
-    ]
-    if not matches:
-        raise ValueError(f"Tool {name!r} not found. Available: {trino_tool_names}")
-    raw_result = await matches[0].ainvoke(arguments)
-    result = _normalize_mcp_result(raw_result)
-    _record_mcp_tool_output(result)
-    return result
+
+    async def _invoke_tool():
+        matches = [
+            tool
+            for tool in trino_tools
+            if tool.name == name or tool.name.endswith(name)
+        ]
+        if not matches:
+            raise ValueError(f"Tool {name!r} not found. Available: {trino_tool_names}")
+        raw_result = await matches[0].ainvoke(arguments)
+        return _normalize_mcp_result(raw_result)
+
+    if not langfuse_enabled():
+        return await _invoke_tool()
+
+    from langfuse import get_client
+
+    client = get_client()
+    with client.start_as_current_observation(
+        as_type="tool",
+        name=f"mcp_trino_{name}",
+        input={"tool": name, "arguments": arguments},
+    ) as tool_obs:
+        result = await _invoke_tool()
+        tool_obs.update(output=_mcp_trace_output(result))
+        return result
 
 
 def _rows_to_markdown(columns, rows, max_rows=20):
@@ -601,10 +681,11 @@ def _trino_sql_cache_key(question: str, catalog: str, schema: str) -> str:
 @observe(name="generate_trino_sql", as_type="span")
 async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"):
     cache_key = _trino_sql_cache_key(question, catalog, schema)
-    hit, cached_sql = cache_lookup("trino_sql", cache_key)
-    if hit and isinstance(cached_sql, str):
-        _mark_cache_hit()
-        return cached_sql
+    if trino_semantic_cache_enabled():
+        hit, cached_sql = cache_lookup("trino_sql", cache_key)
+        if hit and isinstance(cached_sql, str):
+            _mark_cache_hit()
+            return cached_sql
 
     schema_context = await get_trino_schema_context(catalog=catalog, schema=schema)
     messages = [
@@ -632,19 +713,25 @@ async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"
         },
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    raw_sql = _llm_qween_trino_sql(prompt)
+    raw_sql = await _await_llm_generation(
+        "llm_qween_trino_sql",
+        prompt,
+        lambda: llm.invoke(prompt),
+    )
     sql = _normalize_json_sql(_extract_sql(raw_sql))
-    cache_store("trino_sql", cache_key, sql)
+    if trino_semantic_cache_enabled():
+        cache_store("trino_sql", cache_key, sql)
     return sql
 
 
 @observe(name="ask_trino", as_type="span")
 async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_rows=100):
     cache_key = _trino_cache_key(question, catalog, schema, max_rows)
-    hit, cached_payload = cache_lookup("trino_ask", cache_key)
-    if hit and isinstance(cached_payload, dict):
-        _mark_cache_hit()
-        return cached_payload, True
+    if trino_semantic_cache_enabled():
+        hit, cached_payload = cache_lookup("trino_ask", cache_key)
+        if hit and isinstance(cached_payload, dict):
+            _mark_cache_hit()
+            return cached_payload, True
 
     sql = await generate_trino_sql(question, catalog=catalog, schema=schema)
     result = await call_trino_tool("query", {"sql": sql, "max_rows": max_rows})
@@ -663,9 +750,14 @@ async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_row
         },
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    answer = _llm_qween_trino_summary(prompt)
+    answer = await _await_llm_generation(
+        "llm_qween_trino_summary",
+        prompt,
+        lambda: llm.invoke(prompt),
+    )
     if not answer:
         answer = _summarize_result(question, result)
     payload = {"question": question, "sql": sql, "result": result, "answer": answer}
-    cache_store("trino_ask", cache_key, payload)
+    if trino_semantic_cache_enabled():
+        cache_store("trino_ask", cache_key, payload)
     return payload, False
