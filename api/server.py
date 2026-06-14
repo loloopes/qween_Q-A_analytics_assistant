@@ -30,6 +30,7 @@ class AskPdfRequest(TraceRequest):
 class AskPdfResponse(BaseModel):
     question: str
     answer: str
+    cached: bool = False
     request_id: str | None = None
     trace_id: str | None = None
 
@@ -46,6 +47,7 @@ class AskTrinoResponse(BaseModel):
     sql: str
     result: dict
     answer: str
+    cached: bool = False
     request_id: str | None = None
     trace_id: str | None = None
 
@@ -87,6 +89,15 @@ async def lifespan(_: FastAPI):
         print(f"Trino MCP skipped: {service.trino_mcp_error}")
     if service.langfuse_enabled():
         print("Langfuse tracing enabled")
+    try:
+        service.warm_semantic_cache()
+        stats = service.cache_stats()
+        if stats.get("embedder_ready"):
+            print("Semantic cache embedder ready")
+        else:
+            print(f"Semantic cache: exact-match only ({stats.get('last_error', 'embedder not loaded')})")
+    except Exception as exc:
+        print(f"Semantic cache warmup skipped: {exc}")
     yield
     service.flush_langfuse()
 
@@ -111,6 +122,7 @@ def health():
         "trino_tools": service.trino_tool_names,
         "trino_mcp_error": service.trino_mcp_error,
         "langfuse_enabled": service.langfuse_enabled(),
+        "semantic_cache": service.cache_stats(),
     }
 
 
@@ -129,13 +141,14 @@ def ask_pdf(
     trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
         with service.langfuse_api_trace(trace_ctx, operation="ask_pdf") as trace_id:
-            answer = service.answer_from_pdf(body.question)
+            answer, cached = service.answer_from_pdf(body.question)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return AskPdfResponse(
         question=body.question,
         answer=answer,
+        cached=cached,
         request_id=trace_ctx.request_id,
         trace_id=trace_id,
     )
@@ -163,7 +176,7 @@ async def trino_ask(
     trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
         with service.langfuse_api_trace(trace_ctx, operation="trino_ask") as trace_id:
-            payload = await service.ask_trino(
+            payload, cached = await service.ask_trino(
                 body.question,
                 catalog=body.catalog,
                 schema=body.schema,
@@ -174,6 +187,7 @@ async def trino_ask(
 
     return AskTrinoResponse(
         **payload,
+        cached=cached,
         request_id=trace_ctx.request_id,
         trace_id=trace_id,
     )

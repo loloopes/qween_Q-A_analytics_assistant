@@ -9,6 +9,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 ADAPTER_REPO = os.getenv("ADAPTER_REPO", "Glccampos/llm_qween")
+EMBEDDING_MODEL = os.getenv(
+    "SEMANTIC_CACHE_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
 HF_TOKEN = os.getenv("HF_TOKEN") or None
 
 
@@ -29,6 +32,9 @@ def main() -> None:
 
     print(f"Prefetching adapter {ADAPTER_REPO}...", file=sys.stderr)
     snapshot_download(ADAPTER_REPO, token=HF_TOKEN)
+
+    print(f"Prefetching semantic cache embedder {EMBEDDING_MODEL}...", file=sys.stderr)
+    snapshot_download(EMBEDDING_MODEL, token=HF_TOKEN)
 
     print("Verifying load (CPU)...", file=sys.stderr)
     base = AutoModelForCausalLM.from_pretrained(

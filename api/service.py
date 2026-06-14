@@ -22,6 +22,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from peft import PeftModel
 from pypdf import PdfReader
+from semantic_cache import cache_lookup, cache_stats, cache_store, warm_semantic_cache
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 try:
@@ -54,6 +55,17 @@ def flush_langfuse() -> None:
         pass
 
 
+def _mark_cache_hit() -> None:
+    if not langfuse_enabled():
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().update_current_span(metadata={"cache_hit": True})
+    except Exception:
+        pass
+
+
 @dataclass
 class ApiTraceContext:
     request_id: str | None = None
@@ -68,41 +80,38 @@ def langfuse_api_trace(ctx: ApiTraceContext, *, operation: str) -> Iterator[str 
         yield None
         return
 
-    try:
-        from langfuse import get_client, propagate_attributes
+    from langfuse import get_client, propagate_attributes
 
-        client = get_client()
-        trace_context = None
-        if ctx.request_id:
-            trace_context = {
-                "trace_id": client.create_trace_id(seed=ctx.request_id),
-                "parent_span_id": "0000000000000000",
-            }
+    client = get_client()
+    trace_context = None
+    if ctx.request_id:
+        trace_context = {
+            "trace_id": client.create_trace_id(seed=ctx.request_id),
+            "parent_span_id": "0000000000000000",
+        }
 
-        prop_kwargs: dict = {}
-        if ctx.user_id:
-            prop_kwargs["user_id"] = ctx.user_id
-        if ctx.session_id:
-            prop_kwargs["session_id"] = ctx.session_id
-        if ctx.request_id:
-            prop_kwargs.setdefault("metadata", {})["request_id"] = ctx.request_id
+    prop_kwargs: dict = {}
+    if ctx.user_id:
+        prop_kwargs["user_id"] = ctx.user_id
+    if ctx.session_id:
+        prop_kwargs["session_id"] = ctx.session_id
+    if ctx.request_id:
+        prop_kwargs.setdefault("metadata", {})["request_id"] = ctx.request_id
 
-        with client.start_as_current_observation(
-            trace_context=trace_context,
-            as_type="span",
-            name=operation,
-        ):
-            if prop_kwargs:
-                with propagate_attributes(**prop_kwargs):
-                    yield client.get_current_trace_id()
-            else:
+    with client.start_as_current_observation(
+        trace_context=trace_context,
+        as_type="span",
+        name=operation,
+    ):
+        if prop_kwargs:
+            with propagate_attributes(**prop_kwargs):
                 yield client.get_current_trace_id()
-    except Exception:
-        yield None
+        else:
+            yield client.get_current_trace_id()
 
 
 BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-ADAPTER_REPO = os.getenv("ADAPTER_REPO", "Glccampos/llm_qween")
+ADAPTER_REPO = os.getenv("ADAPTER_REPO") or os.getenv("HF_REPO_ID") or "Glccampos/llm_qween"
 HF_TOKEN = os.getenv("HF_TOKEN")
 PDF_PATH = os.getenv("PDF_PATH", str(API_DIR / "Analytics Engineer .pdf"))
 
@@ -379,9 +388,16 @@ def retrieve_context(question: str, top_k: int = 3) -> str:
 
 
 @observe(name="answer_from_pdf", as_type="span")
-def answer_from_pdf(question: str) -> str:
+def answer_from_pdf(question: str) -> tuple[str, bool]:
+    hit, cached_answer = cache_lookup("pdf_qa", question)
+    if hit and isinstance(cached_answer, str):
+        _mark_cache_hit()
+        return cached_answer, True
+
     context = retrieve_context(question)
-    return _llm_qween_pdf_qa(context, question)
+    answer = _llm_qween_pdf_qa(context, question)
+    cache_store("pdf_qa", question, answer)
+    return answer, False
 
 
 def _mcp_trace_output(result: dict) -> dict:
@@ -574,8 +590,22 @@ def _summarize_result(question: str, result: dict) -> str:
     return f"Result preview:\n{preview}"
 
 
+def _trino_cache_key(question: str, catalog: str, schema: str, max_rows: int) -> str:
+    return f"{catalog}|{schema}|{max_rows}|{question}"
+
+
+def _trino_sql_cache_key(question: str, catalog: str, schema: str) -> str:
+    return f"{catalog}|{schema}|{question}"
+
+
 @observe(name="generate_trino_sql", as_type="span")
 async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"):
+    cache_key = _trino_sql_cache_key(question, catalog, schema)
+    hit, cached_sql = cache_lookup("trino_sql", cache_key)
+    if hit and isinstance(cached_sql, str):
+        _mark_cache_hit()
+        return cached_sql
+
     schema_context = await get_trino_schema_context(catalog=catalog, schema=schema)
     messages = [
         {
@@ -603,11 +633,19 @@ async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     raw_sql = _llm_qween_trino_sql(prompt)
-    return _normalize_json_sql(_extract_sql(raw_sql))
+    sql = _normalize_json_sql(_extract_sql(raw_sql))
+    cache_store("trino_sql", cache_key, sql)
+    return sql
 
 
 @observe(name="ask_trino", as_type="span")
 async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_rows=100):
+    cache_key = _trino_cache_key(question, catalog, schema, max_rows)
+    hit, cached_payload = cache_lookup("trino_ask", cache_key)
+    if hit and isinstance(cached_payload, dict):
+        _mark_cache_hit()
+        return cached_payload, True
+
     sql = await generate_trino_sql(question, catalog=catalog, schema=schema)
     result = await call_trino_tool("query", {"sql": sql, "max_rows": max_rows})
 
@@ -628,4 +666,6 @@ async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_row
     answer = _llm_qween_trino_summary(prompt)
     if not answer:
         answer = _summarize_result(question, result)
-    return {"question": question, "sql": sql, "result": result, "answer": answer}
+    payload = {"question": question, "sql": sql, "result": result, "answer": answer}
+    cache_store("trino_ask", cache_key, payload)
+    return payload, False
