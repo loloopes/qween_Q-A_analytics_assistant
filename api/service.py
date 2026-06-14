@@ -8,7 +8,10 @@ import os
 import re
 import sys
 from collections import Counter
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import torch
 from dotenv import load_dotenv
@@ -49,6 +52,53 @@ def flush_langfuse() -> None:
         get_client().flush()
     except Exception:
         pass
+
+
+@dataclass
+class ApiTraceContext:
+    request_id: str | None = None
+    user_id: str | None = None
+    session_id: str | None = None
+
+
+@contextmanager
+def langfuse_api_trace(ctx: ApiTraceContext, *, operation: str) -> Iterator[str | None]:
+    """Attach client IDs to the Langfuse trace for this API request."""
+    if not langfuse_enabled():
+        yield None
+        return
+
+    try:
+        from langfuse import get_client, propagate_attributes
+
+        client = get_client()
+        trace_context = None
+        if ctx.request_id:
+            trace_context = {
+                "trace_id": client.create_trace_id(seed=ctx.request_id),
+                "parent_span_id": "0000000000000000",
+            }
+
+        prop_kwargs: dict = {}
+        if ctx.user_id:
+            prop_kwargs["user_id"] = ctx.user_id
+        if ctx.session_id:
+            prop_kwargs["session_id"] = ctx.session_id
+        if ctx.request_id:
+            prop_kwargs.setdefault("metadata", {})["request_id"] = ctx.request_id
+
+        with client.start_as_current_observation(
+            trace_context=trace_context,
+            as_type="span",
+            name=operation,
+        ):
+            if prop_kwargs:
+                with propagate_attributes(**prop_kwargs):
+                    yield client.get_current_trace_id()
+            else:
+                yield client.get_current_trace_id()
+    except Exception:
+        yield None
 
 
 BASE_MODEL = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")

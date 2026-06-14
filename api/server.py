@@ -5,30 +5,73 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 import service
 
 
-class AskPdfRequest(BaseModel):
+class TraceRequest(BaseModel):
+    request_id: str | None = Field(
+        default=None,
+        description="External request ID; deterministically maps to the Langfuse trace",
+    )
+    user_id: str | None = Field(default=None, description="End-user ID for Langfuse filtering")
+    session_id: str | None = Field(
+        default=None,
+        description="Conversation/session ID; groups related traces in Langfuse",
+    )
+
+
+class AskPdfRequest(TraceRequest):
     question: str = Field(..., min_length=1)
 
 
 class AskPdfResponse(BaseModel):
     question: str
     answer: str
+    request_id: str | None = None
+    trace_id: str | None = None
 
 
-class AskTrinoRequest(BaseModel):
+class AskTrinoRequest(TraceRequest):
     question: str = Field(..., min_length=1)
     catalog: str = "iceberg"
     schema: str = "forecast"
     max_rows: int = Field(default=100, ge=1, le=10_000)
 
 
-class TrinoToolRequest(BaseModel):
+class AskTrinoResponse(BaseModel):
+    question: str
+    sql: str
+    result: dict
+    answer: str
+    request_id: str | None = None
+    trace_id: str | None = None
+
+
+class TrinoToolRequest(TraceRequest):
     arguments: dict = Field(default_factory=dict)
+
+
+class TrinoToolResponse(BaseModel):
+    result: dict
+    request_id: str | None = None
+    trace_id: str | None = None
+
+
+def _trace_context(
+    body: TraceRequest,
+    x_request_id: str | None = Header(None, alias="X-Request-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    x_session_id: str | None = Header(None, alias="X-Session-Id"),
+) -> service.ApiTraceContext:
+    """Body fields take precedence; headers fill in missing values."""
+    return service.ApiTraceContext(
+        request_id=body.request_id or x_request_id,
+        user_id=body.user_id or x_user_id,
+        session_id=body.session_id or x_session_id,
+    )
 
 
 @asynccontextmanager
@@ -72,16 +115,30 @@ def health():
 
 
 @app.post("/ask", response_model=AskPdfResponse)
-def ask_pdf(body: AskPdfRequest):
+def ask_pdf(
+    body: AskPdfRequest,
+    x_request_id: str | None = Header(None, alias="X-Request-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    x_session_id: str | None = Header(None, alias="X-Session-Id"),
+):
     if not service.qa_chain:
         raise HTTPException(status_code=503, detail="Model not loaded")
     if not service.chunks:
         raise HTTPException(status_code=503, detail="PDF index not loaded")
+
+    trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
-        answer = service.answer_from_pdf(body.question)
+        with service.langfuse_api_trace(trace_ctx, operation="ask_pdf") as trace_id:
+            answer = service.answer_from_pdf(body.question)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return AskPdfResponse(question=body.question, answer=answer)
+
+    return AskPdfResponse(
+        question=body.question,
+        answer=answer,
+        request_id=trace_ctx.request_id,
+        trace_id=trace_id,
+    )
 
 
 async def _ensure_trino_mcp() -> None:
@@ -95,29 +152,56 @@ async def _ensure_trino_mcp() -> None:
         )
 
 
-@app.post("/trino/ask")
-async def trino_ask(body: AskTrinoRequest):
+@app.post("/trino/ask", response_model=AskTrinoResponse)
+async def trino_ask(
+    body: AskTrinoRequest,
+    x_request_id: str | None = Header(None, alias="X-Request-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    x_session_id: str | None = Header(None, alias="X-Session-Id"),
+):
     await _ensure_trino_mcp()
+    trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
-        return await service.ask_trino(
-            body.question,
-            catalog=body.catalog,
-            schema=body.schema,
-            max_rows=body.max_rows,
-        )
+        with service.langfuse_api_trace(trace_ctx, operation="trino_ask") as trace_id:
+            payload = await service.ask_trino(
+                body.question,
+                catalog=body.catalog,
+                schema=body.schema,
+                max_rows=body.max_rows,
+            )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    return AskTrinoResponse(
+        **payload,
+        request_id=trace_ctx.request_id,
+        trace_id=trace_id,
+    )
 
-@app.post("/trino/tools/{tool_name}")
-async def trino_tool(tool_name: str, body: TrinoToolRequest):
+
+@app.post("/trino/tools/{tool_name}", response_model=TrinoToolResponse)
+async def trino_tool(
+    tool_name: str,
+    body: TrinoToolRequest,
+    x_request_id: str | None = Header(None, alias="X-Request-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    x_session_id: str | None = Header(None, alias="X-Session-Id"),
+):
     await _ensure_trino_mcp()
+    trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
-        return await service.call_trino_tool(tool_name, body.arguments)
+        with service.langfuse_api_trace(trace_ctx, operation=f"mcp_tool_{tool_name}") as trace_id:
+            result = await service.call_trino_tool(tool_name, body.arguments)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return TrinoToolResponse(
+        result=result,
+        request_id=trace_ctx.request_id,
+        trace_id=trace_id,
+    )
 
 
 @app.post("/trino/reconnect")

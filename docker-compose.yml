@@ -29,6 +29,8 @@ services:
     ports:
       - "${LLM_API_PORT:-8001}:8000"
     env_file:
+      - path: ./.env
+        required: false
       - path: ./api/.env
         required: false
     environment:
@@ -50,6 +52,9 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minio123}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minio123}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
     volumes:
       - hf-cache:/root/.cache/huggingface
     depends_on:
