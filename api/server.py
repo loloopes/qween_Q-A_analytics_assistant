@@ -123,6 +123,7 @@ def health():
         "trino_mcp_error": service.trino_mcp_error,
         "langfuse_enabled": service.langfuse_enabled(),
         "semantic_cache": service.cache_stats(),
+        "trino_cache_enabled": service.trino_semantic_cache_enabled(),
     }
 
 

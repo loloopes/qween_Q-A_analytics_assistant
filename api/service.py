@@ -23,7 +23,13 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from peft import PeftModel
 from pypdf import PdfReader
-from semantic_cache import cache_lookup, cache_stats, cache_store, warm_semantic_cache
+from semantic_cache import (
+    cache_lookup,
+    cache_stats,
+    cache_store,
+    semantic_cache_enabled,
+    warm_semantic_cache,
+)
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 try:
@@ -76,13 +82,11 @@ def _count_tokens(text: str) -> int:
 
 
 def trino_semantic_cache_enabled() -> bool:
-    """Trino answers must hit MCP for live query results; off by default."""
-    return os.getenv("SEMANTIC_CACHE_TRINO_ENABLED", "false").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    """Trino full-response cache. When SEMANTIC_CACHE_TRINO_ENABLED is unset, follows SEMANTIC_CACHE_ENABLED."""
+    explicit = os.getenv("SEMANTIC_CACHE_TRINO_ENABLED")
+    if explicit is not None and explicit.strip():
+        return explicit.strip().lower() in {"1", "true", "yes", "on"}
+    return semantic_cache_enabled()
 
 
 def _run_llm_generation(name: str, prompt: str, invoke) -> str:
@@ -186,12 +190,13 @@ TEMPERATURE = 0.1
 TOP_P = 0.9
 TOP_K = 50
 
-PREDICTION_JSON_SAMPLES = """
-request_json example:
-{"id_cliente": "292659", "id_contrato": null, "tipo_contrato": "Cash loans", "status_contrato": "ativo", "tipo_pagamento": "boleto", "finalidade_emprestimo": "compra_veiculo", "tipo_cliente": "pessoa_fisica", "tipo_portfolio": "varejo", "tipo_produto": "credito_pessoal", "categoria_bem": "automovel", "setor_vendedor": "digital", "canal_venda": "online", "faixa_rendimento": null, "combinacao_produto": null, "area_venda": null, "dia_semana_solicitacao": "SATURDAY", "data_nascimento": "1997-04-08", "data_decisao": "2024-01-01", "data_liberacao": null, "data_primeiro_vencimento": null, "data_ultimo_vencimento_original": null, "data_ultimo_vencimento": null, "data_encerramento": null, "valor_solicitado": 0.0, "valor_credito": 439740.0, "valor_bem": 315000.0, "valor_parcela": 23985.0, "valor_entrada": 0.0, "percentual_entrada": 0.0, "qtd_parcelas_planejadas": 12, "taxa_juros_padrao": 0.03, "taxa_juros_promocional": 0.03, "hora_solicitacao": 14, "flag_ultima_solicitacao_contrato": 0, "flag_ultima_solicitacao_dia": 0, "acompanhantes_cliente": 0, "flag_seguro_contratado": 0, "motivo_recusa": null, "renda_anual": 157500.0, "qtd_membros_familia": 1, "possui_carro": "N", "possui_imovel": "Y"}
+PREDICTION_EVENT_SAMPLES = """
+prediction_events (combined): metadata event_id, event_ts, model_name, model_stage
+plus response columns request_id, probability, threshold_decision, status
+plus request columns:
+id_cliente, id_contrato, tipo_contrato, status_contrato, tipo_pagamento, finalidade_emprestimo, tipo_cliente, tipo_portfolio, tipo_produto, categoria_bem, setor_vendedor, canal_venda, faixa_rendimento, combinacao_produto, area_venda, dia_semana_solicitacao, data_nascimento, data_decisao, data_liberacao, data_primeiro_vencimento, data_ultimo_vencimento_original, data_ultimo_vencimento, data_encerramento, valor_solicitado, valor_credito, valor_bem, valor_parcela, valor_entrada, percentual_entrada, qtd_parcelas_planejadas, taxa_juros_padrao, taxa_juros_promocional, hora_solicitacao, flag_ultima_solicitacao_contrato, flag_ultima_solicitacao_dia, acompanhantes_cliente, flag_seguro_contratado, motivo_recusa, renda_anual, qtd_membros_familia, possui_carro, possui_imovel
 
-response_json example:
-{"request_id": "02e60220-9a7e-418f-abc8-251c8111dfb3", "probability": 0.9504, "threshold_decision": "Negado", "status": "success"}
+prediction_requests (request only): same metadata + request columns; join to prediction_events on event_id
 """
 
 tokenizer = None
@@ -220,7 +225,7 @@ _TRINO_ROUTE_PATTERN = re.compile(
     r"predi[cç][aã]o|predi[cç][oõ]es|prediction|probabilidade|probability|"
     r"threshold|forecast|iceberg|trino|"
     r"quantos?|quanto|how\s+many|count|total|"
-    r"prediction_events|client_id|threshold_decision|"
+    r"prediction_events|id_cliente|threshold_decision|"
     r"solicita[cç][aã]o|aplica[cç][aã]o"
     r")\b"
 )
@@ -624,13 +629,25 @@ def _normalize_json_sql(sql: str) -> str:
         fixed,
     )
     if literal_match:
-        col, field, value = literal_match.groups()
-        replacement = f"json_extract_scalar({col}, '$.{field}') = '{value}'"
+        _col, field, value = literal_match.groups()
+        replacement = f"{field} = '{value}'"
         fixed = fixed[: literal_match.start()] + replacement + fixed[literal_match.end() :]
+    json_extract_match = re.search(
+        r"(?is)json_extract_scalar\s*\(\s*(?:response_json|request_json)\s*,\s*'\$\.([\w_]+)'\s*\)\s*=\s*'([^']*)'",
+        fixed,
+    )
+    if json_extract_match:
+        field, value = json_extract_match.groups()
+        replacement = f"{field} = '{value}'"
+        fixed = (
+            fixed[: json_extract_match.start()]
+            + replacement
+            + fixed[json_extract_match.end() :]
+        )
     if re.search(r"(?i)\bcount\s*\(\s*client_id\s*\)", fixed) and "distinct" not in fixed.lower():
         fixed = re.sub(
             r"(?i)count\s*\(\s*client_id\s*\)",
-            "COUNT(DISTINCT client_id)",
+            "COUNT(DISTINCT id_cliente)",
             fixed,
             count=1,
         )
@@ -654,7 +671,7 @@ async def get_trino_schema_context(catalog="iceberg", schema="forecast", max_tab
                 columns.append(f"{row[0]} {row[1]}")
         table_descriptions.append(f"{full_table_name}: " + ", ".join(columns))
 
-    return "\n".join(table_descriptions) + "\n\n" + PREDICTION_JSON_SAMPLES
+    return "\n".join(table_descriptions) + "\n\n" + PREDICTION_EVENT_SAMPLES
 
 
 def _summarize_result(question: str, result: dict) -> str:
@@ -694,13 +711,12 @@ async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"
             "content": (
                 "You write read-only Trino SQL. Return exactly one SQL query, no markdown. "
                 "Use fully qualified table names from the schema context. "
-                "prediction_events: request_json = HTTP request body (VARCHAR JSON); "
-                "response_json = model output (VARCHAR JSON) with keys like threshold_decision, probability, status. "
-                "NEVER compare request_json/response_json to a JSON literal string. "
-                "ALWAYS filter with json_extract_scalar(column, '$.field') = 'value'. "
-                "Use COUNT(DISTINCT client_id) when counting clients. "
-                "Example: SELECT COUNT(DISTINCT client_id) FROM iceberg.forecast.prediction_events "
-                "WHERE json_extract_scalar(response_json, '$.threshold_decision') = 'Negado'"
+                "prediction_events stores flattened request/response fields as columns "
+                "(e.g. id_cliente, tipo_contrato, probability, threshold_decision, status). "
+                "Filter directly on column names; do not use json_extract_scalar. "
+                "Use COUNT(DISTINCT id_cliente) when counting clients. "
+                "Example: SELECT COUNT(DISTINCT id_cliente) FROM iceberg.forecast.prediction_events "
+                "WHERE threshold_decision = 'Negado'"
             ),
         },
         {
