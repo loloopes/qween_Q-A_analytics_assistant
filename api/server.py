@@ -112,6 +112,7 @@ app = FastAPI(
 
 @app.get("/health")
 def health():
+    langgraph_port = os.getenv("LLM_LANGGRAPH_PORT", "8002")
     return {
         "status": "ok",
         "device": service.DEVICE,
@@ -124,7 +125,20 @@ def health():
         "langfuse_enabled": service.langfuse_enabled(),
         "semantic_cache": service.cache_stats(),
         "trino_cache_enabled": service.trino_semantic_cache_enabled(),
+        "langgraph_health_url": f"http://localhost:{langgraph_port}/health/langgraph",
     }
+
+
+@app.get("/health/langgraph")
+def health_langgraph_moved():
+    langgraph_port = os.getenv("LLM_LANGGRAPH_PORT", "8002")
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "LangGraph runs in the llm-langgraph-api container. "
+            f"Use http://localhost:{langgraph_port}/health/langgraph"
+        ),
+    )
 
 
 @app.post("/ask", response_model=AskPdfResponse)
@@ -233,6 +247,8 @@ async def trino_reconnect():
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("API_HOST", "127.0.0.1")
-    port = int(os.getenv("API_PORT", "8000"))
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", "8001"))
+    print(f"Starting LLM API on http://{host}:{port}", flush=True)
+    print(f"  LangGraph: http://localhost:{port}/health/langgraph", flush=True)
     uvicorn.run("server:app", host=host, port=port, reload=False)

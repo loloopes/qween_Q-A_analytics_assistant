@@ -10,8 +10,11 @@
 #   copy api\.env.example api\.env   # HF_TOKEN, etc.
 #   docker compose up -d --build
 #
-# API (host): http://localhost:8001/docs   (8001 avoids clash with credit_scoring_api on 8000)
-# In-stack:   http://llm-api:8000/ask
+# LangChain API (host): http://localhost:8001/docs
+# LangGraph API (host): http://localhost:8002/docs
+# In-stack:   llm-api:8000  |  llm-langgraph-api:8000
+# LangChain:  GET /health  POST /ask  POST /trino/ask
+# LangGraph:  GET /health/langgraph  POST /ask/langgraph
 
 services:
   llm-api:
@@ -41,6 +44,7 @@ services:
       PDF_PATH: /app/data/analytics_engineer.pdf
       API_HOST: 0.0.0.0
       API_PORT: "8000"
+      LLM_LANGGRAPH_PORT: ${LLM_LANGGRAPH_PORT:-8002}
       TRINO_MCP_SSE_URL: http://llm-trino-mcp:8765/sse
       TRINO_MCP_HOST: llm-trino-mcp
       # MinIO / MLflow (same hostnames as credit_risk_forecast stack on shared networks)
@@ -65,6 +69,48 @@ services:
       - minio_shared
       - credit_risk_shared
       - airflow_shared
+    restart: unless-stopped
+
+  llm-langgraph-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      args:
+        HF_TOKEN: ${HF_TOKEN:-}
+        SKIP_PREFETCH: ${SKIP_PREFETCH:-true}
+        BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+        ADAPTER_REPO: ${ADAPTER_REPO:-Glccampos/llm_qween}
+    image: ${LLM_LANGGRAPH_IMAGE:-local/llm-langgraph-api:latest}
+    container_name: llm-langgraph-api
+    hostname: llm-langgraph-api
+    command: ["python", "server_langgraph.py"]
+    ports:
+      - "${LLM_LANGGRAPH_PORT:-8002}:8000"
+    env_file:
+      - path: ./.env
+        required: false
+      - path: ./api/.env
+        required: false
+    environment:
+      LLM_IN_DOCKER: "1"
+      HF_TOKEN: ${HF_TOKEN:-}
+      BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+      ADAPTER_REPO: ${ADAPTER_REPO:-Glccampos/llm_qween}
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/langgraph"]
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+      retries: 3
+    networks:
+      - llm_internal
     restart: unless-stopped
 
   llm-trino-mcp:

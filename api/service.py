@@ -338,6 +338,11 @@ def _build_trino_mcp_connection(mcp_dir: Path | None = None) -> dict:
 def load_model() -> None:
     global tokenizer, llm, qa_chain
 
+    if llm is not None:
+        print("Model already loaded; skipping load_model().", flush=True)
+        return
+
+    print(f"Loading tokenizer from {ADAPTER_REPO}...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(
         ADAPTER_REPO,
         token=HF_TOKEN,
@@ -346,6 +351,7 @@ def load_model() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    print(f"Loading base model {BASE_MODEL} on {DEVICE}...", flush=True)
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL,
         token=HF_TOKEN,
@@ -354,6 +360,7 @@ def load_model() -> None:
     )
     base_model.to(DEVICE)
 
+    print(f"Loading LoRA adapter from {ADAPTER_REPO}...", flush=True)
     model = PeftModel.from_pretrained(
         base_model,
         ADAPTER_REPO,
@@ -377,6 +384,7 @@ def load_model() -> None:
     model.generation_config.update(**generation_kwargs)
     model.generation_config.max_length = None
 
+    print("Building HuggingFace text-generation pipeline (may take 1–2 min on CPU)...", flush=True)
     text_generation_pipeline = pipeline(
         task="text-generation",
         model=model,
@@ -392,6 +400,7 @@ def load_model() -> None:
         pipeline=text_generation_pipeline,
         pipeline_kwargs=generation_kwargs,
     )
+    print("Model ready.", flush=True)
 
     def format_qa_prompt(inputs):
         context = inputs.get("context", "")
