@@ -1,4 +1,4 @@
-"""LangGraph workflows using the same Qwen HuggingFacePipeline as service.py."""
+"""LangGraph workflows with RAG over Analytics Engineer .pdf (same index as service.py)."""
 
 from __future__ import annotations
 
@@ -13,14 +13,19 @@ import service
 from service import observe
 
 MAX_ITERATIONS = 3
+RAG_TOP_K = 3
 
 should_continue_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You evaluate answer quality. Reply with exactly YES if the answer needs "
-        "improvement, or NO if it is good enough to return to the user.",
+        "You evaluate answer quality against the source context. Reply with exactly YES if "
+        "the answer needs improvement (inaccurate, incomplete, or not grounded in context), "
+        "or NO if it is good enough to return to the user.",
     ),
-    ("user", "Question:\n{input}\n\nAnswer:\n{generation}"),
+    (
+        "user",
+        "Context:\n{context}\n\nQuestion:\n{input}\n\nAnswer:\n{generation}",
+    ),
 ])
 
 reflection_prompt = ChatPromptTemplate.from_messages([
@@ -30,9 +35,13 @@ reflection_prompt = ChatPromptTemplate.from_messages([
 ])
 
 generation_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful assistant that can generate a response to the user's question, and be as sucint an to the point as possible"),
+    (
+        "system",
+        "Answer also using the provided context from the "
+        "Analytics Engineer job description PDF when context is available.",
+    ),
     MessagesPlaceholder(variable_name="messages"),
-    ("user", "{input}"),
+    ("user", "Context:\n{context}\n\nQuestion:\n{input}"),
 ])
 
 _ROLE_MAP = {
@@ -44,6 +53,13 @@ _ROLE_MAP = {
 }
 
 _compiled_graph = None
+
+
+def ensure_pdf_index() -> int:
+    """Load and index Analytics Engineer .pdf if not already indexed."""
+    if not service.chunks:
+        return service.load_pdf_index()
+    return len(service.chunks)
 
 
 def get_llm():
@@ -107,10 +123,27 @@ def _wants_continue(verdict: str) -> bool:
 class GraphState(TypedDict):
     input: str
     messages: Annotated[list[BaseMessage], add_messages]
+    context: str
     generation: str
     reflection: str
     should_continue: bool
     iteration: int
+
+
+@observe(name="langgraph_retrieve", as_type="span")
+def retrieve_node(state: GraphState) -> dict[str, str]:
+    ensure_pdf_index()
+    context = service.retrieve_context(state["input"], top_k=RAG_TOP_K)
+    if service.langfuse_enabled():
+        try:
+            from langfuse import get_client
+
+            get_client().update_current_span(
+                metadata={"top_k": RAG_TOP_K, "context_chars": len(context)},
+            )
+        except Exception:
+            pass
+    return {"context": context}
 
 
 @observe(name="langgraph_generate", as_type="span")
@@ -126,7 +159,11 @@ def generate_node(state: GraphState) -> dict[str, str]:
         )
     generation = invoke_chat_prompt(
         generation_prompt,
-        {"input": user_input, "messages": state.get("messages", [])},
+        {
+            "input": user_input,
+            "context": state.get("context", ""),
+            "messages": state.get("messages", []),
+        },
         name="langgraph_generate",
     )
     return {"generation": generation}
@@ -139,7 +176,11 @@ def should_continue_node(state: GraphState) -> dict[str, bool]:
 
     verdict = invoke_chat_prompt(
         should_continue_prompt,
-        {"input": state["input"], "generation": state["generation"]},
+        {
+            "input": state["input"],
+            "context": state.get("context", ""),
+            "generation": state["generation"],
+        },
         name="langgraph_should_continue",
     )
     should_continue = _wants_continue(verdict)
@@ -158,9 +199,11 @@ def should_continue_node(state: GraphState) -> dict[str, bool]:
 @observe(name="langgraph_reflect", as_type="span")
 def reflect_node(state: GraphState) -> dict[str, str | int]:
     reflection_input = (
+        f"Context:\n{state.get('context', '')}\n\n"
         f"Question:\n{state['input']}\n\n"
         f"Draft answer:\n{state['generation']}\n\n"
-        "Reflect on the draft. Identify gaps, errors, or weak reasoning and explain how to improve it."
+        "Reflect on the draft against the context. Identify gaps, errors, unsupported claims, "
+        "or weak reasoning and explain how to improve it."
     )
     reflection = invoke_chat_prompt(
         reflection_prompt,
@@ -181,10 +224,12 @@ def route_after_should_continue(state: GraphState) -> Literal["reflect", "__end_
 
 def build_graph():
     graph = StateGraph(GraphState)
+    graph.add_node("retrieve", retrieve_node)
     graph.add_node("generate", generate_node)
     graph.add_node("should_continue", should_continue_node)
     graph.add_node("reflect", reflect_node)
-    graph.set_entry_point("generate")
+    graph.set_entry_point("retrieve")
+    graph.add_edge("retrieve", "generate")
     graph.add_edge("generate", "should_continue")
     graph.add_conditional_edges(
         "should_continue",
@@ -221,6 +266,7 @@ def invoke_graph(
         {
             "input": user_input,
             "messages": messages or [],
+            "context": "",
             "generation": "",
             "reflection": "",
             "should_continue": False,
@@ -239,6 +285,7 @@ def invoke_graph(
                     "answer": result.get("generation", ""),
                     "reflection": result.get("reflection", ""),
                     "iterations": result.get("iteration", 0),
+                    "context_chars": len(result.get("context", "")),
                 },
             )
         except Exception:

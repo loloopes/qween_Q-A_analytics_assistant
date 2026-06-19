@@ -31,6 +31,7 @@ class AskGraphResponse(BaseModel):
     generation: str
     reflection: str
     answer: str
+    context: str
     request_id: str | None = None
     trace_id: str | None = None
 
@@ -52,8 +53,10 @@ def _trace_context(
 async def lifespan(_: FastAPI):
     print("Loading model for LangGraph API...", flush=True)
     service.load_model()
+    chunk_count = lg.ensure_pdf_index()
     lg.get_graph()
     print(f"LangGraph API ready on {service.DEVICE}", flush=True)
+    print(f"PDF indexed: {chunk_count} chunk(s) from {service.PDF_PATH}", flush=True)
     if service.langfuse_enabled():
         print("Langfuse tracing enabled", flush=True)
     yield
@@ -62,7 +65,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="LangGraph Qwen API",
-    description="Generate → evaluate → reflect loop (service_langgraph.py)",
+    description="Retrieve from Analytics Engineer PDF → generate → evaluate → reflect loop",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -79,6 +82,9 @@ def health():
         "status": "ok",
         "device": service.DEVICE,
         "model_loaded": service.llm is not None,
+        "pdf_indexed": len(service.chunks) > 0,
+        "pdf_chunks": len(service.chunks),
+        "pdf_path": service.PDF_PATH,
         "graph_ready": lg.get_graph() is not None,
         "langfuse_enabled": service.langfuse_enabled(),
     }
@@ -106,6 +112,7 @@ def ask_graph(
         generation=result["generation"],
         reflection=result["reflection"],
         answer=result["generation"],
+        context=result.get("context", ""),
         request_id=trace_ctx.request_id,
         trace_id=trace_id,
     )
