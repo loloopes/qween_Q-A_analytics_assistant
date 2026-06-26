@@ -16,3 +16,4 @@ uvicorn[standard]>=0.32.0
 langfuse>=3.0.0
 numpy>=1.26.0
 langgraph>=0.5.2
+langsmith>=0.3.0

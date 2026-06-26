@@ -45,3 +45,4 @@ wandb/
 .DS_Store
 Thumbs.db
 .idea/
+.langgraph_api

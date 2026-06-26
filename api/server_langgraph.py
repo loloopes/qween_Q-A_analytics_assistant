@@ -9,6 +9,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+import langsmith_observability as ls
 import service
 import service_langgraph as lg
 
@@ -17,12 +18,12 @@ class AskGraphRequest(BaseModel):
     question: str = Field(..., min_length=1)
     request_id: str | None = Field(
         default=None,
-        description="External request ID; deterministically maps to the Langfuse trace",
+        description="External request ID; maps to the LangSmith run metadata",
     )
-    user_id: str | None = Field(default=None, description="End-user ID for Langfuse filtering")
+    user_id: str | None = Field(default=None, description="End-user ID for LangSmith filtering")
     session_id: str | None = Field(
         default=None,
-        description="Conversation/session ID; groups related traces in Langfuse",
+        description="Conversation/session ID for LangSmith metadata",
     )
 
 
@@ -51,16 +52,17 @@ def _trace_context(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    ls.configure_langsmith()
     print("Loading model for LangGraph API...", flush=True)
     service.load_model()
     chunk_count = lg.ensure_pdf_index()
     lg.get_graph()
     print(f"LangGraph API ready on {service.DEVICE}", flush=True)
     print(f"PDF indexed: {chunk_count} chunk(s) from {service.PDF_PATH}", flush=True)
-    if service.langfuse_enabled():
-        print("Langfuse tracing enabled", flush=True)
+    if ls.langsmith_enabled():
+        print(f"LangSmith tracing enabled (project={ls.langsmith_project()})", flush=True)
     yield
-    service.flush_langfuse()
+    ls.flush_langsmith()
 
 
 app = FastAPI(
@@ -86,7 +88,10 @@ def health():
         "pdf_chunks": len(service.chunks),
         "pdf_path": service.PDF_PATH,
         "graph_ready": lg.get_graph() is not None,
-        "langfuse_enabled": service.langfuse_enabled(),
+        "langsmith_enabled": ls.langsmith_enabled(),
+        "langsmith_project": ls.langsmith_project(),
+        "langsmith_model": ls.langsmith_model_name(),
+        "studio_url": "https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024",
     }
 
 
@@ -102,7 +107,7 @@ def ask_graph(
 
     trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
-        with service.langfuse_api_trace(trace_ctx, operation="ask_langgraph") as trace_id:
+        with ls.langsmith_api_trace(trace_ctx, operation="ask_langgraph") as trace_id:
             result = lg.invoke_graph(body.question)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

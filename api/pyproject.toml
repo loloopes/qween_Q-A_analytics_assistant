@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-api"
+version = "0.1.0"
+description = "LangGraph Qwen API with PDF RAG"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "transformers[torch]",
+    "accelerate",
+    "peft>=0.12.0",
+    "huggingface_hub>=0.24.0",
+    "python-dotenv",
+    "langchain",
+    "langchain-core",
+    "langchain-huggingface",
+    "langchain-text-splitters",
+    "pypdf",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "numpy>=1.26.0",
+    "langgraph>=0.5.2",
+    "langsmith>=0.3.0",
+]
+
+[tool.setuptools]
+py-modules = [
+    "service",
+    "service_langgraph",
+    "server_langgraph",
+    "semantic_cache",
+    "langsmith_observability",
+]

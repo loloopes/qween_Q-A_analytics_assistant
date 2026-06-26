@@ -1,4 +1,4 @@
-"""LangGraph workflows with RAG over Analytics Engineer .pdf (same index as service.py)."""
+"""LangGraph workflows with RAG over Analytics Engineer .pdf (LangSmith observability)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 import service
-from service import observe
+import langsmith_observability as ls
+
+ls.configure_langsmith()
 
 MAX_ITERATIONS = 3
 RAG_TOP_K = 3
@@ -97,18 +99,7 @@ def invoke_chat_prompt(
         tokenize=False,
         add_generation_prompt=True,
     )
-    return service._run_llm_generation(name, text, lambda: llm.invoke(text))
-
-
-def _langfuse_callbacks() -> list[Any]:
-    if not service.langfuse_enabled():
-        return []
-    try:
-        from langfuse.langchain import CallbackHandler
-
-        return [CallbackHandler()]
-    except Exception:
-        return []
+    return ls.run_traced_llm(name, text, lambda: llm.invoke(text))
 
 
 def _wants_continue(verdict: str) -> bool:
@@ -120,7 +111,7 @@ def _wants_continue(verdict: str) -> bool:
     return any(token in normalized for token in ("YES", "IMPROVE", "CONTINUE"))
 
 
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     input: str
     messages: Annotated[list[BaseMessage], add_messages]
     context: str
@@ -130,26 +121,45 @@ class GraphState(TypedDict):
     iteration: int
 
 
-@observe(name="langgraph_retrieve", as_type="span")
+def _coerce_state(state: GraphState) -> GraphState:
+    """Fill missing keys — LangGraph Studio often sends partial state."""
+    return {
+        "input": _question_from_state(state),
+        "messages": state.get("messages") or [],
+        "context": state.get("context", ""),
+        "generation": state.get("generation", ""),
+        "reflection": state.get("reflection", ""),
+        "should_continue": state.get("should_continue", False),
+        "iteration": state.get("iteration", 0),
+    }
+
+
+def _question_from_state(state: GraphState) -> str:
+    explicit = (state.get("input") or "").strip()
+    if explicit:
+        return explicit
+    for message in reversed(state.get("messages") or []):
+        if message.type in {"human", "user"}:
+            content = (message.content or "").strip()
+            if content:
+                return content
+    return ""
+
+
+@ls.traceable(name="langgraph_retrieve", run_type="chain")
 def retrieve_node(state: GraphState) -> dict[str, str]:
+    state = _coerce_state(state)
     ensure_pdf_index()
     context = service.retrieve_context(state["input"], top_k=RAG_TOP_K)
-    if service.langfuse_enabled():
-        try:
-            from langfuse import get_client
-
-            get_client().update_current_span(
-                metadata={"top_k": RAG_TOP_K, "context_chars": len(context)},
-            )
-        except Exception:
-            pass
+    ls.update_current_run_metadata(top_k=RAG_TOP_K, context_chars=len(context))
     return {"context": context}
 
 
-@observe(name="langgraph_generate", as_type="span")
+@ls.traceable(name="langgraph_generate", run_type="chain")
 def generate_node(state: GraphState) -> dict[str, str]:
+    state = _coerce_state(state)
     user_input = state["input"]
-    reflection = state.get("reflection", "")
+    reflection = state["reflection"]
     if reflection:
         user_input = (
             f"{user_input}\n\n"
@@ -161,45 +171,41 @@ def generate_node(state: GraphState) -> dict[str, str]:
         generation_prompt,
         {
             "input": user_input,
-            "context": state.get("context", ""),
-            "messages": state.get("messages", []),
+            "context": state["context"],
+            "messages": state["messages"],
         },
         name="langgraph_generate",
     )
     return {"generation": generation}
 
 
-@observe(name="langgraph_should_continue", as_type="span")
+@ls.traceable(name="langgraph_should_continue", run_type="chain")
 def should_continue_node(state: GraphState) -> dict[str, bool]:
-    if state.get("iteration", 0) >= MAX_ITERATIONS:
+    state = _coerce_state(state)
+    if state["iteration"] >= MAX_ITERATIONS:
+        return {"should_continue": False}
+    if not state["generation"].strip():
         return {"should_continue": False}
 
     verdict = invoke_chat_prompt(
         should_continue_prompt,
         {
             "input": state["input"],
-            "context": state.get("context", ""),
+            "context": state["context"],
             "generation": state["generation"],
         },
         name="langgraph_should_continue",
     )
     should_continue = _wants_continue(verdict)
-    if service.langfuse_enabled():
-        try:
-            from langfuse import get_client
-
-            get_client().update_current_span(
-                metadata={"verdict": verdict, "should_continue": should_continue},
-            )
-        except Exception:
-            pass
+    ls.update_current_run_metadata(verdict=verdict, should_continue=should_continue)
     return {"should_continue": should_continue}
 
 
-@observe(name="langgraph_reflect", as_type="span")
+@ls.traceable(name="langgraph_reflect", run_type="chain")
 def reflect_node(state: GraphState) -> dict[str, str | int]:
+    state = _coerce_state(state)
     reflection_input = (
-        f"Context:\n{state.get('context', '')}\n\n"
+        f"Context:\n{state['context']}\n\n"
         f"Question:\n{state['input']}\n\n"
         f"Draft answer:\n{state['generation']}\n\n"
         "Reflect on the draft against the context. Identify gaps, errors, unsupported claims, "
@@ -207,17 +213,18 @@ def reflect_node(state: GraphState) -> dict[str, str | int]:
     )
     reflection = invoke_chat_prompt(
         reflection_prompt,
-        {"input": reflection_input, "messages": state.get("messages", [])},
+        {"input": reflection_input, "messages": state["messages"]},
         name="langgraph_reflect",
     )
     return {
         "reflection": reflection,
-        "iteration": state.get("iteration", 0) + 1,
+        "iteration": state["iteration"] + 1,
     }
 
 
 def route_after_should_continue(state: GraphState) -> Literal["reflect", "__end__"]:
-    if state.get("should_continue", False):
+    state = _coerce_state(state)
+    if state["should_continue"]:
         return "reflect"
     return END
 
@@ -240,6 +247,18 @@ def build_graph():
     return graph.compile()
 
 
+def make_graph():
+    """LangGraph Studio / `langgraph dev` entrypoint (see langgraph.json)."""
+    return build_graph()
+
+
+def studio_default_input() -> GraphState:
+    """Default state shown in LangGraph Studio."""
+    return _initial_state(
+        "What skills are required for the Analytics Engineer role?",
+    )
+
+
 def get_graph():
     global _compiled_graph
     if _compiled_graph is None:
@@ -252,45 +271,38 @@ def draw_mermaid() -> str:
     return get_graph().get_graph().draw_mermaid()
 
 
-@observe(name="invoke_graph", as_type="span")
+def _initial_state(
+    user_input: str,
+    messages: list[BaseMessage] | None = None,
+) -> GraphState:
+    return {
+        "input": user_input,
+        "messages": messages or [],
+        "context": "",
+        "generation": "",
+        "reflection": "",
+        "should_continue": False,
+        "iteration": 0,
+    }
+
+
+@ls.traceable(name="invoke_graph", run_type="chain")
 def invoke_graph(
     user_input: str,
     messages: list[BaseMessage] | None = None,
 ) -> GraphState:
-    config: dict[str, Any] = {}
-    callbacks = _langfuse_callbacks()
-    if callbacks:
-        config["callbacks"] = callbacks
+    config = ls.langsmith_run_config(question=user_input)
+    with ls.token_tracking_context() as token_totals:
+        result = get_graph().invoke(_initial_state(user_input, messages), config=config)
 
-    result = get_graph().invoke(
-        {
-            "input": user_input,
-            "messages": messages or [],
-            "context": "",
-            "generation": "",
-            "reflection": "",
-            "should_continue": False,
-            "iteration": 0,
-        },
-        config=config,
+    ls.update_current_run_usage(**token_totals)
+    ls.update_current_run_metadata(
+        answer=result.get("generation", ""),
+        reflection=result.get("reflection", ""),
+        iterations=result.get("iteration", 0),
+        context_chars=len(result.get("context", "")),
+        ls_model_name=ls.langsmith_model_name(),
     )
-
-    if service.langfuse_enabled():
-        try:
-            from langfuse import get_client
-
-            get_client().update_current_span(
-                input={"question": user_input},
-                output={
-                    "answer": result.get("generation", ""),
-                    "reflection": result.get("reflection", ""),
-                    "iterations": result.get("iteration", 0),
-                    "context_chars": len(result.get("context", "")),
-                },
-            )
-        except Exception:
-            pass
-
     return result
 
 

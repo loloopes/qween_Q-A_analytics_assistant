@@ -25,7 +25,7 @@ COPY requirements-docker.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements-docker.txt
 
-COPY service.py service_langgraph.py server.py server_langgraph.py semantic_cache.py ./
+COPY service.py service_langgraph.py server.py server_langgraph.py semantic_cache.py langsmith_observability.py langgraph.json pyproject.toml ./
 COPY scripts/prefetch_models.py ./scripts/prefetch_models.py
 COPY ["Analytics Engineer .pdf", "/app/data/analytics_engineer.pdf"]
 
