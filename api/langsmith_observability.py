@@ -188,9 +188,39 @@ def run_traced_llm(name: str, prompt: str, invoke) -> str:
             if costs:
                 extra_metadata.update(costs)
             run.set(usage_metadata=usage, metadata=extra_metadata)
-            run.end(outputs={"text": output})
+            run.end(outputs={"text": output, "output": output})
 
         return output
+
+
+def _truncate_text(value: Any, limit: int = 8000) -> Any:
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "...[truncated]"
+
+
+def patch_current_run_io(
+    *,
+    inputs: dict[str, Any] | None = None,
+    outputs: dict[str, Any] | None = None,
+) -> None:
+    """Set LangSmith run inputs/outputs so the UI shows text (not just metadata)."""
+    if not langsmith_enabled():
+        return
+    try:
+        from langsmith import get_current_run_tree
+
+        run = get_current_run_tree()
+        if run is None:
+            return
+        if inputs is not None:
+            run.inputs = inputs
+        if outputs is not None:
+            run.outputs = outputs
+    except Exception:
+        pass
 
 
 def update_current_run_metadata(**metadata: Any) -> None:
@@ -235,9 +265,14 @@ def update_current_run_usage(
 
 
 @contextmanager
-def langsmith_api_trace(ctx: ApiTraceContext, *, operation: str) -> Iterator[str | None]:
+def langsmith_api_trace(
+    ctx: ApiTraceContext,
+    *,
+    operation: str,
+    inputs: dict[str, Any] | None = None,
+) -> Iterator[tuple[str | None, Any]]:
     if not langsmith_enabled():
-        yield None
+        yield None, lambda **_kwargs: None
         return
 
     from langsmith.run_helpers import trace
@@ -250,9 +285,33 @@ def langsmith_api_trace(ctx: ApiTraceContext, *, operation: str) -> Iterator[str
     if ctx.session_id:
         metadata["session_id"] = ctx.session_id
 
-    with trace(
-        name=operation,
-        run_type="chain",
-        metadata=metadata or None,
-    ) as run:
-        yield str(run.id) if run is not None else None
+    trace_kwargs: dict[str, Any] = {
+        "name": operation,
+        "run_type": "chain",
+        "inputs": inputs or {},
+        "metadata": metadata or None,
+    }
+    if ctx.session_id:
+        trace_kwargs["session_id"] = ctx.session_id
+
+    try:
+        trace_cm = trace(**trace_kwargs)
+    except TypeError:
+        trace_kwargs.pop("session_id", None)
+        trace_cm = trace(**trace_kwargs)
+
+    with trace_cm as run:
+
+        def finish(
+            *,
+            outputs: dict[str, Any] | None = None,
+            error: str | None = None,
+        ) -> None:
+            if run is None:
+                return
+            if error:
+                run.end(error=error)
+            else:
+                run.end(outputs=outputs or {})
+
+        yield str(run.id) if run is not None else None, finish

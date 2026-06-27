@@ -147,7 +147,16 @@ def _question_from_state(state: GraphState) -> str:
 def retrieve_node(state: GraphState) -> dict[str, str]:
     state = _coerce_state(state)
     ensure_rag_index()
-    context = service.retrieve_context(state["input"], top_k=RAG_TOP_K)
+    question = state["input"]
+    context = service.retrieve_context(question, top_k=RAG_TOP_K)
+    ls.patch_current_run_io(
+        inputs={"question": question},
+        outputs={
+            "question": question,
+            "context": ls._truncate_text(context),
+            "context_chars": len(context),
+        },
+    )
     ls.update_current_run_metadata(top_k=RAG_TOP_K, context_chars=len(context))
     return {"context": context}
 
@@ -173,6 +182,13 @@ def generate_node(state: GraphState) -> dict[str, str]:
         },
         name="langgraph_generate",
     )
+    ls.patch_current_run_io(
+        inputs={
+            "question": state["input"],
+            "context": ls._truncate_text(state["context"]),
+        },
+        outputs={"generation": generation},
+    )
     return {"generation": generation}
 
 
@@ -194,6 +210,14 @@ def should_continue_node(state: GraphState) -> dict[str, bool]:
         name="langgraph_should_continue",
     )
     should_continue = _wants_continue(verdict)
+    ls.patch_current_run_io(
+        inputs={
+            "question": state["input"],
+            "generation": state["generation"],
+            "context": ls._truncate_text(state["context"]),
+        },
+        outputs={"verdict": verdict, "should_continue": should_continue},
+    )
     ls.update_current_run_metadata(verdict=verdict, should_continue=should_continue)
     return {"should_continue": should_continue}
 
@@ -212,6 +236,14 @@ def reflect_node(state: GraphState) -> dict[str, str | int]:
         reflection_prompt,
         {"input": reflection_input, "messages": state["messages"]},
         name="langgraph_reflect",
+    )
+    ls.patch_current_run_io(
+        inputs={
+            "question": state["input"],
+            "generation": state["generation"],
+            "context": ls._truncate_text(state["context"]),
+        },
+        outputs={"reflection": reflection, "iteration": state["iteration"] + 1},
     )
     return {
         "reflection": reflection,
@@ -290,12 +322,23 @@ def invoke_graph(
     with ls.token_tracking_context() as token_totals:
         result = get_graph().invoke(_initial_state(user_input, messages), config=config)
 
+    context = result.get("context", "") or ""
+    ls.patch_current_run_io(
+        inputs={"question": user_input},
+        outputs={
+            "question": user_input,
+            "generation": result.get("generation", ""),
+            "reflection": result.get("reflection", ""),
+            "context": ls._truncate_text(context),
+            "iterations": result.get("iteration", 0),
+        },
+    )
     ls.update_current_run_usage(**token_totals)
     ls.update_current_run_metadata(
         answer=result.get("generation", ""),
         reflection=result.get("reflection", ""),
         iterations=result.get("iteration", 0),
-        context_chars=len(result.get("context", "")),
+        context_chars=len(context),
         ls_model_name=ls.langsmith_model_name(),
     )
     return result

@@ -107,8 +107,25 @@ def ask_graph(
 
     trace_ctx = _trace_context(body, x_request_id, x_user_id, x_session_id)
     try:
-        with ls.langsmith_api_trace(trace_ctx, operation="ask_langgraph") as trace_id:
-            result = lg.invoke_graph(body.question)
+        with ls.langsmith_api_trace(
+            trace_ctx,
+            operation="ask_langgraph",
+            inputs={"question": body.question},
+        ) as (trace_id, finish):
+            try:
+                result = lg.invoke_graph(body.question)
+                finish(
+                    outputs={
+                        "question": body.question,
+                        "answer": result.get("generation", ""),
+                        "generation": result.get("generation", ""),
+                        "reflection": result.get("reflection", ""),
+                        "context": ls._truncate_text(result.get("context", "")),
+                    }
+                )
+            except Exception as exc:
+                finish(error=str(exc))
+                raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
