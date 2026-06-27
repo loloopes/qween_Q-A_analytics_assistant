@@ -1,0 +1,30 @@
+# Optional GPU overlay — use when NVIDIA Container Toolkit works in Docker.
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+services:
+  llm-api:
+    build:
+      args:
+        TORCH_VARIANT: ${TORCH_VARIANT:-gpu}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${LLM_GPU_COUNT:-1}
+              capabilities: [gpu]
+    environment:
+      LLM_DEVICE: ${LLM_DEVICE:-cuda}
+
+  llm-langgraph-api:
+    build:
+      args:
+        TORCH_VARIANT: ${TORCH_VARIANT:-gpu}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${LLM_GPU_COUNT:-1}
+              capabilities: [gpu]
+    environment:
+      LLM_DEVICE: ${LLM_DEVICE:-cuda}

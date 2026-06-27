@@ -22,3 +22,5 @@ numpy>=1.26.0
 langgraph>=0.5.2
 langgraph-cli[inmem]
 langsmith>=0.3.0
+psycopg[binary]>=3.2.0
+python-multipart>=0.0.9

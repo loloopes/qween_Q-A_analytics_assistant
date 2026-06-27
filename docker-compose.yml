@@ -1,20 +1,13 @@
-# LLM Q&A API — join the same Docker networks as MinIO, MLflow, Airflow, and Trino.
+# LLM Q&A API — same service names and networks as k8s/data-platform.
 #
-# Prereqs (from repo root):
-#   cd credit_risk_forecast && docker compose up -d          # creates minio_minio, credit_risk_forecast_default
-#   docker compose -f docker-compose.airflow.yml up -d       # Airflow on credit_risk_forecast_default
-#   cd ../trino && docker compose up -d                        # creates trino_trino-network (optional, for /trino/ask)
-#
-# Run:
-#   cd llm
-#   copy api\.env.example api\.env   # HF_TOKEN, etc.
-#   docker compose up -d --build
+# CPU/GPU: set LLM_USE_GPU in llm/.env (false | true | auto), then:
+#   ./scripts/compose.sh up -d --build
+# Full local stack: from repo root  make local-up
 #
 # LangChain API (host): http://localhost:8001/docs
 # LangGraph API (host): http://localhost:8002/docs
-# In-stack:   llm-api:8000  |  llm-langgraph-api:8000
-# LangChain:  GET /health  POST /ask  POST /trino/ask
-# LangGraph:  GET /health/langgraph  POST /ask/langgraph
+# pgvector (host):      localhost:5433  (vector/vector, db=vectors)
+# Trino (host):         http://localhost:8086
 
 services:
   llm-api:
@@ -26,6 +19,7 @@ services:
         SKIP_PREFETCH: ${SKIP_PREFETCH:-true}
         BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
         ADAPTER_REPO: ${ADAPTER_REPO:-Glccampos/llm_qween}
+        TORCH_VARIANT: ${TORCH_VARIANT:-cpu}
     image: ${LLM_API_IMAGE:-local/llm-api:latest}
     container_name: llm-api
     hostname: llm-api
@@ -38,10 +32,19 @@ services:
         required: false
     environment:
       LLM_IN_DOCKER: "1"
+      LLM_DEVICE: ${LLM_DEVICE:-cpu}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       HF_TOKEN: ${HF_TOKEN:-}
       BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
       ADAPTER_REPO: ${ADAPTER_REPO:-Glccampos/llm_qween}
-      PDF_PATH: /app/data/analytics_engineer.pdf
+      DOCUMENTS_DIR: /app/documents
+      # In-container DNS (do not use localhost:5433 from llm/.env — that is for host-only runs)
+      PGVECTOR_HOST: pgvector
+      PGVECTOR_PORT: "5432"
+      PGVECTOR_USER: ${PGVECTOR_USER:-vector}
+      PGVECTOR_PASSWORD: ${PGVECTOR_PASSWORD:-vector}
+      PGVECTOR_DB: ${PGVECTOR_DB:-vectors}
+      RAG_AUTO_INGEST: ${RAG_AUTO_INGEST:-false}
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       LLM_LANGGRAPH_PORT: ${LLM_LANGGRAPH_PORT:-8002}
@@ -61,6 +64,7 @@ services:
       LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
     volumes:
       - hf-cache:/root/.cache/huggingface
+      - ./api/documents:/app/documents
     depends_on:
       llm-trino-mcp:
         condition: service_healthy
@@ -69,6 +73,7 @@ services:
       - minio_shared
       - credit_risk_shared
       - airflow_shared
+      - trino_shared
     restart: unless-stopped
 
   llm-langgraph-api:
@@ -80,6 +85,7 @@ services:
         SKIP_PREFETCH: ${SKIP_PREFETCH:-true}
         BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
         ADAPTER_REPO: ${ADAPTER_REPO:-Glccampos/llm_qween}
+        TORCH_VARIANT: ${TORCH_VARIANT:-cpu}
     image: ${LLM_LANGGRAPH_IMAGE:-local/llm-langgraph-api:latest}
     container_name: llm-langgraph-api
     hostname: llm-langgraph-api
@@ -93,9 +99,18 @@ services:
         required: false
     environment:
       LLM_IN_DOCKER: "1"
+      LLM_DEVICE: ${LLM_DEVICE:-cpu}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
       HF_TOKEN: ${HF_TOKEN:-}
       BASE_MODEL: ${BASE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
       ADAPTER_REPO: ${ADAPTER_REPO:-Glccampos/llm_qween}
+      DOCUMENTS_DIR: /app/documents
+      PGVECTOR_HOST: pgvector
+      PGVECTOR_PORT: "5432"
+      PGVECTOR_USER: ${PGVECTOR_USER:-vector}
+      PGVECTOR_PASSWORD: ${PGVECTOR_PASSWORD:-vector}
+      PGVECTOR_DB: ${PGVECTOR_DB:-vectors}
+      RAG_AUTO_INGEST: ${RAG_AUTO_INGEST:-false}
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
@@ -108,6 +123,7 @@ services:
       LANGSMITH_OUTPUT_PRICE_PER_UNIT: ${LANGSMITH_OUTPUT_PRICE_PER_UNIT:-0}
     volumes:
       - hf-cache:/root/.cache/huggingface
+      - ./api/documents:/app/documents
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/langgraph"]
       interval: 30s
@@ -116,6 +132,7 @@ services:
       retries: 3
     networks:
       - llm_internal
+      - trino_shared
     restart: unless-stopped
 
   llm-trino-mcp:

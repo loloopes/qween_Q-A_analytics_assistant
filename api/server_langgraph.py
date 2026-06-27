@@ -55,10 +55,11 @@ async def lifespan(_: FastAPI):
     ls.configure_langsmith()
     print("Loading model for LangGraph API...", flush=True)
     service.load_model()
-    chunk_count = lg.ensure_pdf_index()
+    chunk_count = lg.ensure_rag_index()
     lg.get_graph()
     print(f"LangGraph API ready on {service.DEVICE}", flush=True)
-    print(f"PDF indexed: {chunk_count} chunk(s) from {service.PDF_PATH}", flush=True)
+    print(f"RAG chunks in pgvector: {chunk_count}", flush=True)
+    print(f"Documents dir: {service.DOCUMENTS_DIR}", flush=True)
     if ls.langsmith_enabled():
         print(f"LangSmith tracing enabled (project={ls.langsmith_project()})", flush=True)
     yield
@@ -67,7 +68,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="LangGraph Qwen API",
-    description="Retrieve from Analytics Engineer PDF → generate → evaluate → reflect loop",
+    description="Retrieve from pgvector → generate → evaluate → reflect loop",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -84,9 +85,8 @@ def health():
         "status": "ok",
         "device": service.DEVICE,
         "model_loaded": service.llm is not None,
-        "pdf_indexed": len(service.chunks) > 0,
-        "pdf_chunks": len(service.chunks),
-        "pdf_path": service.PDF_PATH,
+        "rag": service.rag_stats(),
+        "documents_dir": str(service.DOCUMENTS_DIR),
         "graph_ready": lg.get_graph() is not None,
         "langsmith_enabled": ls.langsmith_enabled(),
         "langsmith_project": ls.langsmith_project(),

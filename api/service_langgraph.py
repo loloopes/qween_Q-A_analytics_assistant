@@ -1,4 +1,4 @@
-"""LangGraph workflows with RAG over Analytics Engineer .pdf (LangSmith observability)."""
+"""LangGraph workflows with pgvector RAG (LangSmith observability)."""
 
 from __future__ import annotations
 
@@ -39,8 +39,7 @@ reflection_prompt = ChatPromptTemplate.from_messages([
 generation_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Answer also using the provided context from the "
-        "Analytics Engineer job description PDF when context is available.",
+        "Answer using the provided context from indexed documents when context is available.",
     ),
     MessagesPlaceholder(variable_name="messages"),
     ("user", "Context:\n{context}\n\nQuestion:\n{input}"),
@@ -57,11 +56,9 @@ _ROLE_MAP = {
 _compiled_graph = None
 
 
-def ensure_pdf_index() -> int:
-    """Load and index Analytics Engineer .pdf if not already indexed."""
-    if not service.chunks:
-        return service.load_pdf_index()
-    return len(service.chunks)
+def ensure_rag_index() -> int:
+    """Ensure pgvector index is ready (optional auto-ingest from DOCUMENTS_DIR)."""
+    return service.ensure_rag_index()
 
 
 def get_llm():
@@ -149,7 +146,7 @@ def _question_from_state(state: GraphState) -> str:
 @ls.traceable(name="langgraph_retrieve", run_type="chain")
 def retrieve_node(state: GraphState) -> dict[str, str]:
     state = _coerce_state(state)
-    ensure_pdf_index()
+    ensure_rag_index()
     context = service.retrieve_context(state["input"], top_k=RAG_TOP_K)
     ls.update_current_run_metadata(top_k=RAG_TOP_K, context_chars=len(context))
     return {"context": context}
@@ -254,9 +251,7 @@ def make_graph():
 
 def studio_default_input() -> GraphState:
     """Default state shown in LangGraph Studio."""
-    return _initial_state(
-        "What skills are required for the Analytics Engineer role?",
-    )
+    return _initial_state("Summarize the main topics covered in the indexed documents.")
 
 
 def get_graph():

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import sys
 import asyncio
-from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,9 +18,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
 from langchain_huggingface import HuggingFacePipeline
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from peft import PeftModel
-from pypdf import PdfReader
+import rag_store
 from semantic_cache import (
     cache_lookup,
     cache_stats,
@@ -183,7 +180,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 LANGFUSE_MODEL_NAME = os.getenv("LANGFUSE_MODEL_NAME", "qween")
 LANGFUSE_INPUT_PRICE_PER_UNIT = float(os.getenv("LANGFUSE_INPUT_PRICE_PER_UNIT", "0.01"))
 LANGFUSE_OUTPUT_PRICE_PER_UNIT = float(os.getenv("LANGFUSE_OUTPUT_PRICE_PER_UNIT", "0.01"))
-PDF_PATH = os.getenv("PDF_PATH", str(API_DIR / "Analytics Engineer .pdf"))
+DOCUMENTS_DIR = rag_store.DOCUMENTS_DIR
 
 USE_SAMPLING = True
 TEMPERATURE = 0.1
@@ -202,9 +199,6 @@ prediction_requests (request only): same metadata + request columns; join to pre
 tokenizer = None
 llm = None
 qa_chain = None
-chunks: list[str] = []
-chunk_term_counts: list[Counter] = []
-document_frequencies: Counter = Counter()
 
 mcp_client: MultiServerMCPClient | None = None
 trino_tools: list = []
@@ -212,7 +206,23 @@ trino_tool_names: list[str] = []
 trino_mcp_ready = False
 trino_mcp_error: str | None = None
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def _resolve_device() -> str:
+    """Pick inference device from LLM_DEVICE or auto-detect CUDA."""
+    explicit = (os.getenv("LLM_DEVICE") or "").strip().lower()
+    if explicit == "cpu":
+        return "cpu"
+    if explicit in {"cuda", "gpu"} or explicit.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            print(
+                "WARNING: LLM_DEVICE requests CUDA but torch.cuda.is_available() is False; using CPU.",
+                flush=True,
+            )
+            return "cpu"
+        return "cuda"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+DEVICE = _resolve_device()
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 # Heuristic keywords for routing /ask → Trino (credit-risk / prediction_events domain).
@@ -232,7 +242,7 @@ _TRINO_ROUTE_PATTERN = re.compile(
 
 
 def should_route_to_trino(question: str) -> bool:
-    """True when a natural-language question should use Trino instead of PDF RAG."""
+    """True when a natural-language question should use Trino instead of document RAG."""
     return bool(_TRINO_ROUTE_PATTERN.search(question.strip()))
 
 
@@ -384,7 +394,11 @@ def load_model() -> None:
     model.generation_config.update(**generation_kwargs)
     model.generation_config.max_length = None
 
-    print("Building HuggingFace text-generation pipeline (may take 1–2 min on CPU)...", flush=True)
+    backend = "GPU" if DEVICE == "cuda" else "CPU"
+    print(
+        f"Building HuggingFace text-generation pipeline ({backend}; may take 1–2 min)...",
+        flush=True,
+    )
     text_generation_pipeline = pipeline(
         task="text-generation",
         model=model,
@@ -423,14 +437,14 @@ def load_model() -> None:
     qa_chain = RunnableLambda(format_qa_prompt) | llm | StrOutputParser()
 
 
-def _llm_qween_pdf_qa(context: str, question: str) -> str:
+def _llm_qween_rag_qa(context: str, question: str) -> str:
     prompt = (
         "Answer the question using only the context when context is provided.\n\n"
         f"Context:\n{context}\n\n"
         f"Question:\n{question}"
     )
     return _run_llm_generation(
-        "llm_qween_pdf_qa",
+        "llm_qween_rag_qa",
         prompt,
         lambda: qa_chain.invoke({"context": context, "question": question}),
     )
@@ -444,65 +458,30 @@ def _llm_qween_trino_summary(prompt: str) -> str:
     return _run_llm_generation("llm_qween_trino_summary", prompt, lambda: llm.invoke(prompt))
 
 
-def load_pdf_index(pdf_path: str | None = None) -> int:
-    global chunks, chunk_term_counts, document_frequencies
-
-    path = Path(pdf_path or PDF_PATH)
-    if not path.is_file():
-        raise FileNotFoundError(f"PDF not found: {path}")
-
-    reader = PdfReader(str(path))
-    pdf_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=120,
-    )
-    chunks = text_splitter.split_text(pdf_text)
-    chunk_term_counts = [Counter(_tokenize_for_retrieval(chunk)) for chunk in chunks]
-    document_frequencies = Counter(
-        term for counts in chunk_term_counts for term in counts.keys()
-    )
-    return len(chunks)
-
-
-def _tokenize_for_retrieval(text: str) -> list[str]:
-    return re.findall(r"[a-zA-Z0-9]+", text.lower())
+def ensure_rag_index() -> int:
+    """Ensure pgvector RAG index is ready (optional auto-ingest from DOCUMENTS_DIR)."""
+    rag_store.warm()
+    return rag_store.chunk_count()
 
 
 def retrieve_context(question: str, top_k: int = 3) -> str:
-    query_terms = _tokenize_for_retrieval(question)
-    if not query_terms:
-        return "\n\n".join(chunks[:top_k])
-
-    scored_chunks = []
-    for index, (chunk, term_counts) in enumerate(zip(chunks, chunk_term_counts)):
-        score = 0.0
-        for term in query_terms:
-            if term not in term_counts:
-                continue
-            idf = math.log((len(chunks) + 1) / (document_frequencies[term] + 1)) + 1
-            score += term_counts[term] * idf
-        scored_chunks.append((score, index, chunk))
-
-    best_chunks = [
-        chunk
-        for score, _, chunk in sorted(scored_chunks, reverse=True)[:top_k]
-        if score > 0
-    ]
-    return "\n\n---\n\n".join(best_chunks or chunks[:top_k])
+    return rag_store.retrieve_context(question, top_k=top_k)
 
 
-@observe(name="answer_from_pdf", as_type="span")
-def answer_from_pdf(question: str) -> tuple[str, bool]:
-    hit, cached_answer = cache_lookup("pdf_qa", question)
+def rag_stats() -> dict:
+    return rag_store.stats()
+
+
+@observe(name="answer_from_rag", as_type="span")
+def answer_from_rag(question: str) -> tuple[str, bool]:
+    hit, cached_answer = cache_lookup("rag_qa", question)
     if hit and isinstance(cached_answer, str):
         _mark_cache_hit()
         return cached_answer, True
 
     context = retrieve_context(question)
-    answer = _llm_qween_pdf_qa(context, question)
-    cache_store("pdf_qa", question, answer)
+    answer = _llm_qween_rag_qa(context, question)
+    cache_store("rag_qa", question, answer)
     return answer, False
 
 
