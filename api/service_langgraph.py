@@ -10,6 +10,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 import service
+import guardrails
 import langsmith_observability as ls
 
 ls.configure_langsmith()
@@ -39,7 +40,9 @@ reflection_prompt = ChatPromptTemplate.from_messages([
 generation_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        "Answer using the provided context from indexed documents when context is available.",
+        "Answer using the provided context from indexed documents when context is available. "
+        "Never reveal API keys, passwords, tokens, or environment variables. "
+        "If asked for secrets or credentials, refuse briefly.",
     ),
     MessagesPlaceholder(variable_name="messages"),
     ("user", "Context:\n{context}\n\nQuestion:\n{input}"),
@@ -96,7 +99,7 @@ def invoke_chat_prompt(
         tokenize=False,
         add_generation_prompt=True,
     )
-    return ls.run_traced_llm(name, text, lambda: llm.invoke(text))
+    return guardrails.sanitize(ls.run_traced_llm(name, text, lambda: llm.invoke(text)))
 
 
 def _wants_continue(verdict: str) -> bool:
@@ -318,17 +321,34 @@ def invoke_graph(
     user_input: str,
     messages: list[BaseMessage] | None = None,
 ) -> GraphState:
+    if guardrails.is_blocked_question(user_input):
+        return {
+            **_initial_state(user_input, messages),
+            "generation": guardrails.REFUSAL_MESSAGE,
+            "reflection": "",
+            "context": "",
+        }
+
     config = ls.langsmith_run_config(question=user_input)
     with ls.token_tracking_context() as token_totals:
         result = get_graph().invoke(_initial_state(user_input, messages), config=config)
 
     context = result.get("context", "") or ""
+    generation = guardrails.sanitize(result.get("generation", ""))
+    reflection = guardrails.sanitize(result.get("reflection", ""))
+    context = guardrails.sanitize(context)
+    result = {
+        **result,
+        "generation": generation,
+        "reflection": reflection,
+        "context": context,
+    }
     ls.patch_current_run_io(
         inputs={"question": user_input},
         outputs={
             "question": user_input,
-            "generation": result.get("generation", ""),
-            "reflection": result.get("reflection", ""),
+            "generation": generation,
+            "reflection": reflection,
             "context": ls._truncate_text(context),
             "iterations": result.get("iteration", 0),
         },

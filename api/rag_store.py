@@ -15,6 +15,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
 import embeddings
+import guardrails
 
 logger = logging.getLogger(__name__)
 
@@ -422,7 +423,8 @@ def retrieve_context(question: str, top_k: int | None = None) -> str:
         return ""
 
     _last_error = None
-    return "\n\n---\n\n".join(row[0] for row in rows)
+    context = "\n\n---\n\n".join(row[0] for row in rows)
+    return guardrails.sanitize(context)
 
 
 def stats() -> dict[str, Any]:

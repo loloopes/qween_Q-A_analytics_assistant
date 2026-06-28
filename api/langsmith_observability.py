@@ -9,6 +9,8 @@ from typing import Any, Iterator
 
 from service import ApiTraceContext
 
+import guardrails
+
 try:
     from langsmith import traceable as _langsmith_traceable
 except ImportError:  # pragma: no cover
@@ -168,10 +170,11 @@ def run_traced_llm(name: str, prompt: str, invoke) -> str:
     with trace(
         name=name,
         run_type="llm",
-        inputs={"prompt": prompt},
+        inputs={"prompt": guardrails.sanitize(prompt)},
         metadata={"ls_model_name": model},
     ) as run:
         output = invoke().strip()
+        output = guardrails.sanitize(output)
         input_tokens = count_tokens(prompt)
         output_tokens = count_tokens(output)
         usage = usage_metadata(input_tokens, output_tokens)

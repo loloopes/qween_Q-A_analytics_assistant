@@ -30,7 +30,7 @@ RUN if [ "$TORCH_VARIANT" = "gpu" ]; then \
     fi \
     && pip install --no-cache-dir -r requirements-docker.txt
 
-COPY service.py service_langgraph.py server.py server_langgraph.py semantic_cache.py embeddings.py rag_store.py langsmith_observability.py langgraph.json pyproject.toml ./
+COPY service.py service_langgraph.py server.py server_langgraph.py semantic_cache.py embeddings.py rag_store.py guardrails.py langsmith_observability.py langgraph.json pyproject.toml ./
 COPY scripts/prefetch_models.py ./scripts/prefetch_models.py
 COPY documents/ /app/documents/
 

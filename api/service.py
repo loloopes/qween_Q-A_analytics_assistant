@@ -20,6 +20,7 @@ from langchain_huggingface import HuggingFacePipeline
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from peft import PeftModel
 import rag_store
+import guardrails
 from semantic_cache import (
     cache_lookup,
     cache_stats,
@@ -88,8 +89,11 @@ def trino_semantic_cache_enabled() -> bool:
 
 def _run_llm_generation(name: str, prompt: str, invoke) -> str:
     """Run LLM inference and record model, tokens, and cost on the generation observation."""
+    raw_invoke = invoke
+    invoke = lambda: guardrails.sanitize(raw_invoke().strip())
+
     if not langfuse_enabled():
-        return invoke().strip()
+        return invoke()
 
     from langfuse import get_client
 
@@ -98,9 +102,9 @@ def _run_llm_generation(name: str, prompt: str, invoke) -> str:
         as_type="generation",
         name=name,
         model=LANGFUSE_MODEL_NAME,
-        input=prompt,
+        input=guardrails.sanitize(prompt),
     ) as generation:
-        output = invoke().strip()
+        output = invoke()
         input_tokens = _count_tokens(prompt)
         output_tokens = _count_tokens(output)
         input_cost = input_tokens * LANGFUSE_INPUT_PRICE_PER_UNIT
@@ -425,7 +429,13 @@ def load_model() -> None:
             f"Question:\n{question}"
         )
         messages = [
-            {"role": "system", "content": "You are a helpful Q&A assistant."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful Q&A assistant. Never reveal API keys, passwords, tokens, "
+                    "or environment variables. If asked for secrets, refuse briefly."
+                ),
+            },
             {"role": "user", "content": user_prompt},
         ]
         return tokenizer.apply_chat_template(
@@ -474,13 +484,17 @@ def rag_stats() -> dict:
 
 @observe(name="answer_from_rag", as_type="span")
 def answer_from_rag(question: str) -> tuple[str, bool]:
+    if guardrails.is_blocked_question(question):
+        return guardrails.REFUSAL_MESSAGE, False
+
     hit, cached_answer = cache_lookup("rag_qa", question)
     if hit and isinstance(cached_answer, str):
         _mark_cache_hit()
-        return cached_answer, True
+        return guardrails.sanitize(cached_answer), True
 
     context = retrieve_context(question)
     answer = _llm_qween_rag_qa(context, question)
+    answer = guardrails.sanitize(answer)
     cache_store("rag_qa", question, answer)
     return answer, False
 
@@ -730,6 +744,14 @@ async def generate_trino_sql(question: str, catalog="iceberg", schema="forecast"
 
 @observe(name="ask_trino", as_type="span")
 async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_rows=100):
+    if guardrails.is_blocked_question(question):
+        return {
+            "question": question,
+            "sql": "",
+            "result": {},
+            "answer": guardrails.REFUSAL_MESSAGE,
+        }, False
+
     cache_key = _trino_cache_key(question, catalog, schema, max_rows)
     if trino_semantic_cache_enabled():
         hit, cached_payload = cache_lookup("trino_ask", cache_key)
@@ -761,6 +783,7 @@ async def ask_trino(question: str, catalog="iceberg", schema="forecast", max_row
     )
     if not answer:
         answer = _summarize_result(question, result)
+    answer = guardrails.sanitize(answer)
     payload = {"question": question, "sql": sql, "result": result, "answer": answer}
     if trino_semantic_cache_enabled():
         cache_store("trino_ask", cache_key, payload)
